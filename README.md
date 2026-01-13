@@ -1,6 +1,6 @@
 <div align="center">
 
-# codex-wrapped
+# codex-wrapped-noyrlimit
 
 **Your year in code, beautifully visualized.**
 
@@ -31,19 +31,19 @@ Generate a personalized "Spotify Wrapped"-style summary of your [Codex](https://
 Run directly without installing:
 
 ```bash
-npx codex-wrapped # or bunx, or yarn/pnpm dlx
+npx codex-wrapped-noyrlimit # or bunx, or yarn/pnpm dlx
 ```
 
 ### Global Install
 
 ```bash
-npm install -g codex-wrapped # or bun/yarn/pnpm
+npm install -g codex-wrapped-noyrlimit # or bun/yarn/pnpm
 ```
 
 Then run anywhere:
 
 ```bash
-codex-wrapped
+codex-wrapped-noyrlimit
 ```
 
 ## Usage Options

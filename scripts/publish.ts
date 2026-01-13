@@ -16,9 +16,107 @@ const dryRun = args.includes("--dry-run");
 const versionArg = args.find((arg) => !arg.startsWith("--"));
 // Append a prerelease suffix during dry runs to avoid "already published" errors
 const version = dryRun && versionArg ? `${versionArg}-dry-run.${Date.now()}` : versionArg;
+let publishDelayMs = 0;
 
 if (!version) {
   console.error("Usage: bun run scripts/publish.ts <version> [--dry-run]");
+  process.exit(1);
+}
+
+const repoDotenvPath = path.join(dir, ".env");
+const repoNpmrcPath = path.join(dir, ".npmrc");
+
+function loadDotenvIfPresent(dotenvPath: string) {
+  if (!fs.existsSync(dotenvPath)) return;
+  try {
+    const content = fs.readFileSync(dotenvPath, "utf8");
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eqIndex = trimmed.indexOf("=");
+      if (eqIndex === -1) continue;
+
+      const key = trimmed.slice(0, eqIndex).trim();
+      if (!key || process.env[key] !== undefined) continue;
+
+      let value = trimmed.slice(eqIndex + 1).trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      process.env[key] = value;
+    }
+  } catch {
+    // Ignore dotenv read/parse errors
+  }
+}
+
+loadDotenvIfPresent(repoDotenvPath);
+publishDelayMs = Math.max(0, Number(process.env.PUBLISH_DELAY_MS ?? "2000")) || 0;
+
+// Ensure npm commands (publish/view/etc.) use this repo's `.npmrc` (which expects `NPM_TOKEN`)
+// even when we `cwd` into `dist/*`. Only do this when `NPM_TOKEN` is available so we don't
+// override a user's global npm auth config unnecessarily.
+if (
+  process.env.NPM_TOKEN &&
+  !process.env.NPM_CONFIG_USERCONFIG &&
+  fs.existsSync(repoNpmrcPath)
+) {
+  process.env.NPM_CONFIG_USERCONFIG = repoNpmrcPath;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRateLimited(error: unknown): boolean {
+  const stderr = (error as any)?.stderr;
+  const message = (error as any)?.message;
+  const combined = `${stderr ?? ""}\n${message ?? ""}`.toLowerCase();
+  return combined.includes("e429") || combined.includes("too many requests") || combined.includes("rate limited");
+}
+
+async function publishWithRetry(targetPath: string): Promise<void> {
+  const maxRetries = 6;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      if (dryRun) {
+        await $`npm publish --access public --dry-run --tag dry-run`.cwd(targetPath);
+      } else {
+        await $`npm publish --access public`.cwd(targetPath);
+      }
+      return;
+    } catch (error) {
+      if (!isRateLimited(error) || attempt === maxRetries) throw error;
+
+      // Exponential-ish backoff with jitter, capped at 10 minutes.
+      const baseMs = 30_000;
+      const delayMs = Math.min(10 * 60_000, baseMs * 2 ** attempt);
+      const jitterMs = Math.floor(Math.random() * 5_000);
+      const waitMs = delayMs + jitterMs;
+      console.log(`⏳ npm rate limited; retrying in ${Math.round(waitMs / 1000)}s...`);
+      await sleep(waitMs);
+    }
+  }
+}
+
+async function hasNpmAuth(): Promise<boolean> {
+  if (process.env.NPM_TOKEN) return true;
+  try {
+    const output = await $`npm whoami`.text();
+    return output.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+if (!dryRun && !(await hasNpmAuth())) {
+  console.error("Not authenticated with npm.");
+  console.error("Either set NPM_TOKEN (env or .env) or run `npm login`, then retry:");
+  console.error(`  bun run scripts/publish.ts ${version}`);
   process.exit(1);
 }
 
@@ -77,7 +175,7 @@ await Bun.file(`./dist/${targetpackageName}/package.json`).write(
       name: pkg.name,
       version,
       description: pkg.description,
-      bin: { [targetpackageName]: `./bin/${targetpackageName}` },
+      bin: { [targetpackageName]: `bin/${targetpackageName}` },
       scripts: { postinstall: "node ./postinstall.mjs" },
       optionalDependencies: binaries,
       repository: pkg.repository,
@@ -108,14 +206,15 @@ for (const [name] of Object.entries(binaries)) {
   await $`mkdir -p ${path.join(targetPath, "assets")}`;
   await $`cp -r assets/images ${path.join(targetPath, "assets/")}`;
 
-  if (dryRun) {
-    await $`npm publish --access public --dry-run --tag dry-run`.cwd(targetPath);
-    console.log(`✅ Would publish ${name}`);
-  } else if (await isPublished(name, version)) {
+  if (!dryRun && (await isPublished(name, version))) {
     console.log(`⏭️  Skipping ${name} (already published)`);
   } else {
-    await $`npm publish --access public`.cwd(targetPath);
-    console.log(`✅ Published ${name}`);
+    await publishWithRetry(targetPath);
+    console.log(`${dryRun ? "✅ Would publish" : "✅ Published"} ${name}`);
+  }
+
+  if (!dryRun && publishDelayMs > 0) {
+    await sleep(publishDelayMs);
   }
 }
 
@@ -123,14 +222,11 @@ for (const [name] of Object.entries(binaries)) {
 console.log("\n📤 Publishing main package...");
 
 const mainPackagePath = path.join(dir, "dist", targetpackageName);
-if (dryRun) {
-  await $`npm publish --access public --dry-run --tag dry-run`.cwd(mainPackagePath);
-  console.log(`✅ Would publish ${pkg.name}`);
-} else if (await isPublished(pkg.name, version)) {
+if (!dryRun && (await isPublished(pkg.name, version))) {
   console.log(`⏭️  Skipping ${pkg.name} (already published)`);
 } else {
-  await $`npm publish --access public`.cwd(mainPackagePath);
-  console.log(`✅ Published ${pkg.name}`);
+  await publishWithRetry(mainPackagePath);
+  console.log(`${dryRun ? "✅ Would publish" : "✅ Published"} ${pkg.name}`);
 }
 
 // Summary

@@ -1,5 +1,5 @@
 {
-  "name": "codex-wrapped",
+  "name": "codex-wrapped-noyrlimit",
   "version": "1.0.0",
   "author": {
     "name": "Numman Ali",
@@ -23,7 +23,7 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "codex-wrapped": "./bin/codex-wrapped"
+    "codex-wrapped-noyrlimit": "bin/codex-wrapped-noyrlimit"
   },
   "scripts": {
     "start": "bun src/index.ts",

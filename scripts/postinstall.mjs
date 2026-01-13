@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Postinstall script for codex-wrapped
+ * Postinstall script for codex-wrapped-noyrlimit
  *
  * This script runs after npm install and symlinks the correct platform-specific
  * binary to the bin directory. It auto-detects:
@@ -109,7 +109,7 @@ function getPackageName() {
   }
 
   // Build package name parts
-  const parts = ["codex-wrapped", platform, arch];
+  const parts = ["codex-wrapped-noyrlimit", platform, arch];
 
   // Add baseline suffix for x64 without AVX2
   if (arch === "x64" && !detectAVX2()) {
@@ -128,7 +128,8 @@ function getPackageName() {
  * Find the binary from the platform package
  */
 function findBinary(packageName) {
-  const binaryName = os.platform() === "win32" ? "codex-wrapped.exe" : "codex-wrapped";
+  const binaryName =
+    os.platform() === "win32" ? "codex-wrapped-noyrlimit.exe" : "codex-wrapped-noyrlimit";
 
   try {
     const packageJsonPath = require.resolve(`${packageName}/package.json`);
@@ -201,13 +202,13 @@ async function main() {
     const packageName = getPackageName();
 
     if (!packageName) {
-      console.error(`codex-wrapped: Unsupported platform: ${os.platform()}-${os.arch()}`);
+      console.error(`codex-wrapped-noyrlimit: Unsupported platform: ${os.platform()}-${os.arch()}`);
       console.error("Please download the binary manually from:");
       console.error("https://github.com/numman-ali/codex-wrapped/releases");
       process.exit(0); // Exit gracefully
     }
 
-    console.log(`codex-wrapped: Detected platform package: ${packageName}`);
+    console.log(`codex-wrapped-noyrlimit: Detected platform package: ${packageName}`);
 
     const result = findBinary(packageName);
 
@@ -217,7 +218,7 @@ async function main() {
       const basePackage = baseParts.join("-");
 
       if (basePackage !== packageName) {
-        console.log(`codex-wrapped: Trying fallback package: ${basePackage}`);
+        console.log(`codex-wrapped-noyrlimit: Trying fallback package: ${basePackage}`);
         const fallbackResult = findBinary(basePackage);
 
         if (fallbackResult) {
@@ -226,7 +227,7 @@ async function main() {
         }
       }
 
-      console.error(`codex-wrapped: Could not find binary for ${packageName}`);
+      console.error(`codex-wrapped-noyrlimit: Could not find binary for ${packageName}`);
       console.error("The optional dependency may have failed to install.");
       console.error("Please download the binary manually from:");
       console.error("https://github.com/numman-ali/codex-wrapped/releases");
@@ -235,7 +236,7 @@ async function main() {
 
     linkBinary(result.binaryPath, result.binaryName);
   } catch (error) {
-    console.error("codex-wrapped: Postinstall error:", error.message);
+    console.error("codex-wrapped-noyrlimit: Postinstall error:", error.message);
     process.exit(0); // Exit gracefully to not break npm install
   }
 }
