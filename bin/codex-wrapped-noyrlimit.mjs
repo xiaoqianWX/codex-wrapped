@@ -2,12 +2,12 @@
 
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import { dirname, join } from "node:path";
-import { platform as osPlatform, arch as osArch } from "node:os";
+import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const __dirname = path.dirname(__filename);
 
 function run(target) {
   const result = spawnSync(target, process.argv.slice(2), {
@@ -31,34 +31,36 @@ const archMap = {
   arm64: "arm64",
 };
 
-let platform = platformMap[osPlatform()];
+let platform = platformMap[os.platform()];
 if (!platform) {
-  platform = osPlatform();
+  platform = os.platform();
 }
-let arch = archMap[osArch()];
+let arch = archMap[os.arch()];
 if (!arch) {
-  arch = osArch();
+  arch = os.arch();
 }
+
 const base = "codex-wrapped-noyrlimit-" + platform + "-" + arch;
-const binary = platform === "windows" ? "codex-wrapped-noyrlimit.exe" : "codex-wrapped-noyrlimit";
+const binary =
+  platform === "windows" ? "codex-wrapped-noyrlimit.exe" : "codex-wrapped-noyrlimit";
 
 function findBinary(startDir) {
   let current = startDir;
   for (;;) {
-    const modules = join(current, "node_modules");
+    const modules = path.join(current, "node_modules");
     if (fs.existsSync(modules)) {
       const entries = fs.readdirSync(modules);
       for (const entry of entries) {
         if (!entry.startsWith(base)) {
           continue;
         }
-        const candidate = join(modules, entry, "bin", binary);
+        const candidate = path.join(modules, entry, "bin", binary);
         if (fs.existsSync(candidate)) {
           return candidate;
         }
       }
     }
-    const parent = dirname(current);
+    const parent = path.dirname(current);
     if (parent === current) {
       return;
     }
