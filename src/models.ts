@@ -14,70 +14,89 @@ interface ModelsDevData {
   providers: Record<string, ProviderInfo>;
 }
 
-// Cache for the fetched data
-let cachedData: ModelsDevData | null = null;
+const MODELS_API_URL = "https://models.dev/api.json";
+const FETCH_ABORT_TIMEOUT_MS = 3000;
+const FETCH_HARD_TIMEOUT_MS = 4000;
+const EMPTY_DATA: ModelsDevData = { models: {}, providers: {} };
+
+let cachedData: ModelsDevData = EMPTY_DATA;
+let fetchAttempted = false;
+let fetchInFlight: Promise<ModelsDevData> | null = null;
 
 export async function fetchModelsData(): Promise<ModelsDevData> {
-  if (cachedData) {
+  if (fetchAttempted) {
     return cachedData;
   }
+  if (fetchInFlight) {
+    return fetchInFlight;
+  }
 
-  try {
-    const response = await fetch("https://models.dev/api.json", {
-      signal: AbortSignal.timeout(5000),
-    });
+  fetchInFlight = (async () => {
+    const controller = new AbortController();
+    const abortTimeout = setTimeout(() => controller.abort(), FETCH_ABORT_TIMEOUT_MS);
+    try {
+      const response = await withTimeout(
+        fetch(MODELS_API_URL, { signal: controller.signal }),
+        FETCH_HARD_TIMEOUT_MS,
+        "models.dev request timed out"
+      );
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
 
-    const data = await response.json();
+      const data = await withTimeout(
+        response.json(),
+        FETCH_HARD_TIMEOUT_MS,
+        "models.dev response parsing timed out"
+      );
 
-    const models: Record<string, ModelInfo> = {};
-    const providers: Record<string, ProviderInfo> = {};
+      const models: Record<string, ModelInfo> = {};
+      const providers: Record<string, ProviderInfo> = {};
 
-    if (data && typeof data === "object") {
-      for (const [providerId, providerData] of Object.entries(data)) {
-        if (!providerData || typeof providerData !== "object") continue;
+      if (data && typeof data === "object") {
+        for (const [providerId, providerData] of Object.entries(data)) {
+          if (!providerData || typeof providerData !== "object") continue;
 
-        const pd = providerData as { name?: string; models?: Record<string, { name?: string }> };
+          const pd = providerData as { name?: string; models?: Record<string, { name?: string }> };
 
-        if (pd.name) {
-          providers[providerId] = {
-            id: providerId,
-            name: pd.name,
-          };
-        }
+          if (pd.name) {
+            providers[providerId] = {
+              id: providerId,
+              name: pd.name,
+            };
+          }
 
-        if (pd.models && typeof pd.models === "object") {
-          for (const [modelId, modelData] of Object.entries(pd.models)) {
-            if (modelData && typeof modelData === "object" && modelData.name) {
-              models[modelId] = {
-                id: modelId,
-                name: modelData.name,
-                provider: providerId,
-              };
+          if (pd.models && typeof pd.models === "object") {
+            for (const [modelId, modelData] of Object.entries(pd.models)) {
+              if (modelData && typeof modelData === "object" && modelData.name) {
+                models[modelId] = {
+                  id: modelId,
+                  name: modelData.name,
+                  provider: providerId,
+                };
+              }
             }
           }
         }
       }
-    }
 
-    cachedData = { models, providers };
-    return cachedData;
-  } catch (error) {
-    console.warn("Failed to fetch models.dev data, using fallbacks");
-    cachedData = { models: {}, providers: {} };
-    return cachedData;
-  }
+      cachedData = { models, providers };
+      return cachedData;
+    } catch {
+      cachedData = EMPTY_DATA;
+      return cachedData;
+    } finally {
+      clearTimeout(abortTimeout);
+      fetchAttempted = true;
+      fetchInFlight = null;
+    }
+  })();
+
+  return fetchInFlight;
 }
 
 export function getModelDisplayName(modelId: string): string {
-  if (!cachedData) {
-    console.warn("Models data not prefetched, using fallback formatting");
-    return normalizeModelName(formatModelIdAsName(modelId));
-  }
-
   if (cachedData.models[modelId]?.name) {
     return normalizeModelName(cachedData.models[modelId].name);
   }
@@ -86,11 +105,6 @@ export function getModelDisplayName(modelId: string): string {
 }
 
 export function getModelProvider(modelId: string): string {
-  if (!cachedData) {
-    console.warn("Models data not prefetched");
-    return "unknown";
-  }
-
   if (cachedData.models[modelId]?.provider) {
     return cachedData.models[modelId].provider;
   }
@@ -124,4 +138,20 @@ function formatModelIdAsName(modelId: string): string {
 
 function normalizeModelName(name: string): string {
   return name.replace(/\bgpt\b/gi, "GPT").replace(/\bgpt(?=[-0-9])/gi, "GPT");
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
 }

@@ -126,6 +126,18 @@ export async function collectCodexUsageData(year: number): Promise<CodexUsageDat
   const sessions: SessionUsage[] = [];
 
   for (const filePath of files) {
+    let snapshotSize = 0;
+    try {
+      const fileInfo = await stat(filePath);
+      snapshotSize = fileInfo.size;
+    } catch {
+      continue;
+    }
+
+    if (snapshotSize <= 0) {
+      continue;
+    }
+
     let previousTotals: RawUsage | null = null;
     let currentModel: string | undefined;
     let currentModelIsFallback = false;
@@ -138,7 +150,7 @@ export async function collectCodexUsageData(year: number): Promise<CodexUsageDat
     const sessionEvents: CodexUsageEvent[] = [];
 
     const rl = createInterface({
-      input: createReadStream(filePath),
+      input: createReadStream(filePath, { start: 0, end: snapshotSize - 1 }),
       crlfDelay: Infinity,
     });
 
@@ -299,7 +311,7 @@ export async function collectCodexUsageData(year: number): Promise<CodexUsageDat
   let totalMessages = 0;
   let totalSessions = 0;
   let earliestSessionDate: Date | null = null;
-  const priorSessionsByCwd = new Map<string, SessionDedupSignatures[]>();
+  const priorSessionsByCwd = new Map<string, CwdDedupIndex>();
   const sessionsById = new Map<string, SessionDedupSignatures>();
 
   sessions.sort(compareSessionsByDate);
@@ -327,28 +339,31 @@ export async function collectCodexUsageData(year: number): Promise<CodexUsageDat
       const tokenOverlap = commonPrefixLength(session.tokenSignatures, parentSession.tokenSignatures);
       tokenStartIndex = tokenOverlap;
     } else if (session.cwd) {
-      const previousSessions = priorSessionsByCwd.get(session.cwd) ?? [];
-      const messageOverlap = findLargestPrefixOverlap(
-        session.messageSignatures,
-        previousSessions.map((item) => item.messageSignatures)
-      );
-      if (shouldApplyForkDedup(messageOverlap, session.messageSignatures.length)) {
-        messageStartIndex = messageOverlap;
+      const previous = priorSessionsByCwd.get(session.cwd) ?? { messageSequences: [], tokenSequences: [] };
+
+      if (session.messageSignatures.length > 0) {
+        const messageOverlap = findLargestPrefixOverlap(session.messageSignatures, previous.messageSequences);
+        if (shouldApplyForkDedup(messageOverlap, session.messageSignatures.length)) {
+          messageStartIndex = messageOverlap;
+        }
       }
 
-      const tokenOverlap = findLargestPrefixOverlap(
-        session.tokenSignatures,
-        previousSessions.map((item) => item.tokenSignatures)
-      );
-      if (shouldApplyForkDedup(tokenOverlap, session.tokenSignatures.length)) {
-        tokenStartIndex = tokenOverlap;
+      if (session.tokenSignatures.length > 0) {
+        const tokenOverlap = findLargestPrefixOverlap(session.tokenSignatures, previous.tokenSequences);
+        if (shouldApplyForkDedup(tokenOverlap, session.tokenSignatures.length)) {
+          tokenStartIndex = tokenOverlap;
+        }
       }
 
-      previousSessions.push({
-        messageSignatures: session.messageSignatures,
-        tokenSignatures: session.tokenSignatures,
-      });
-      priorSessionsByCwd.set(session.cwd, previousSessions);
+      if (session.messageSignatures.length > 0 || session.tokenSignatures.length > 0) {
+        if (session.messageSignatures.length > 0) {
+          previous.messageSequences.push(session.messageSignatures);
+        }
+        if (session.tokenSignatures.length > 0) {
+          previous.tokenSequences.push(session.tokenSignatures);
+        }
+        priorSessionsByCwd.set(session.cwd, previous);
+      }
     }
 
     for (const message of session.userMessages.slice(messageStartIndex)) {
@@ -395,6 +410,11 @@ type SessionUserMessage = {
 type SessionDedupSignatures = {
   messageSignatures: string[];
   tokenSignatures: string[];
+};
+
+type CwdDedupIndex = {
+  messageSequences: string[][];
+  tokenSequences: string[][];
 };
 
 type SessionUsage = SessionDedupSignatures & {
