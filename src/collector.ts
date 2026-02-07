@@ -9,6 +9,11 @@ import { createInterface } from "node:readline";
 const CODEX_DATA_PATH = join(os.homedir(), ".codex");
 const CODEX_HISTORY_PATH = join(CODEX_DATA_PATH, "history.jsonl");
 const CODEX_SESSIONS_PATH = join(CODEX_DATA_PATH, "sessions");
+const SESSION_PARSE_TIMEOUT_MS = Math.max(500, Number(process.env.CODEX_WRAPPED_FILE_PARSE_TIMEOUT_MS ?? "3000"));
+const SESSION_ACTIVE_SKIP_MS = Math.max(0, Number(process.env.CODEX_WRAPPED_SKIP_RECENT_MS ?? "0"));
+const MAX_JSONL_LINE_LENGTH = Math.max(1024, Number(process.env.CODEX_WRAPPED_MAX_LINE_LENGTH ?? "1000000"));
+const FS_OP_TIMEOUT_MS = Math.max(500, Number(process.env.CODEX_WRAPPED_FS_OP_TIMEOUT_MS ?? "1000"));
+const DEBUG_COLLECT = process.env.CODEX_WRAPPED_DEBUG_COLLECT === "1";
 
 export interface CodexUsageEvent {
   timestamp: string;
@@ -31,7 +36,8 @@ export interface CodexUsageData {
 
 export async function checkCodexDataExists(): Promise<boolean> {
   try {
-    const info = await stat(CODEX_SESSIONS_PATH);
+    const info = await withTimeout(stat(CODEX_SESSIONS_PATH), FS_OP_TIMEOUT_MS);
+    if (!info) return false;
     return info.isDirectory();
   } catch {
     return false;
@@ -47,7 +53,8 @@ async function listAllCodexSessionFiles(): Promise<string[]> {
   const files: string[] = [];
   let yearDirs: Array<string> = [];
   try {
-    const entries = await readdir(CODEX_SESSIONS_PATH, { withFileTypes: true });
+    const entries = await withTimeout(readdir(CODEX_SESSIONS_PATH, { withFileTypes: true }), FS_OP_TIMEOUT_MS);
+    if (!entries) return files;
     yearDirs = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
   } catch {
     return files;
@@ -65,7 +72,8 @@ async function listCodexSessionFilesInDirectory(yearPath: string): Promise<strin
   const files: string[] = [];
   let monthDirs: Array<string> = [];
   try {
-    const entries = await readdir(yearPath, { withFileTypes: true });
+    const entries = await withTimeout(readdir(yearPath, { withFileTypes: true }), FS_OP_TIMEOUT_MS);
+    if (!entries) return files;
     monthDirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
   } catch {
     return files;
@@ -75,7 +83,8 @@ async function listCodexSessionFilesInDirectory(yearPath: string): Promise<strin
     const monthPath = join(yearPath, month);
     let dayDirs: Array<string> = [];
     try {
-      const entries = await readdir(monthPath, { withFileTypes: true });
+      const entries = await withTimeout(readdir(monthPath, { withFileTypes: true }), FS_OP_TIMEOUT_MS);
+      if (!entries) continue;
       dayDirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
     } catch {
       continue;
@@ -84,7 +93,8 @@ async function listCodexSessionFilesInDirectory(yearPath: string): Promise<strin
     for (const day of dayDirs) {
       const dayPath = join(monthPath, day);
       try {
-        const entries = await readdir(dayPath, { withFileTypes: true });
+        const entries = await withTimeout(readdir(dayPath, { withFileTypes: true }), FS_OP_TIMEOUT_MS);
+        if (!entries) continue;
         for (const entry of entries) {
           if (entry.isFile() && entry.name.endsWith(".jsonl")) {
             files.push(join(dayPath, entry.name));
@@ -123,18 +133,31 @@ export async function getCodexFirstPromptTimestamp(): Promise<number | null> {
 
 export async function collectCodexUsageData(year: number): Promise<CodexUsageData> {
   const files = await listAllCodexSessionFiles();
+  if (DEBUG_COLLECT) {
+    console.error(`[collector] start year=${year} files=${files.length}`);
+  }
   const sessions: SessionUsage[] = [];
 
-  for (const filePath of files) {
+  for (const [index, filePath] of files.entries()) {
+    if (DEBUG_COLLECT && index % 100 === 0) {
+      console.error(`[collector] file ${index + 1}/${files.length}`);
+    }
     let snapshotSize = 0;
+    let snapshotMtimeMs = 0;
     try {
-      const fileInfo = await stat(filePath);
+      const fileInfo = await withTimeout(stat(filePath), FS_OP_TIMEOUT_MS);
+      if (!fileInfo) continue;
       snapshotSize = fileInfo.size;
+      snapshotMtimeMs = fileInfo.mtimeMs;
     } catch {
       continue;
     }
 
     if (snapshotSize <= 0) {
+      continue;
+    }
+
+    if (SESSION_ACTIVE_SKIP_MS > 0 && Date.now() - snapshotMtimeMs < SESSION_ACTIVE_SKIP_MS) {
       continue;
     }
 
@@ -149,142 +172,162 @@ export async function collectCodexUsageData(year: number): Promise<CodexUsageDat
     const userMessages: SessionUserMessage[] = [];
     const sessionEvents: CodexUsageEvent[] = [];
 
+    const sessionStream = createReadStream(filePath, { start: 0, end: snapshotSize - 1 });
     const rl = createInterface({
-      input: createReadStream(filePath, { start: 0, end: snapshotSize - 1 }),
+      input: sessionStream,
       crlfDelay: Infinity,
     });
+    const timeoutHandle = setTimeout(() => {
+      sessionStream.destroy(new Error("session file parse timeout"));
+    }, SESSION_PARSE_TIMEOUT_MS);
+    let parseFailed = false;
 
-    for await (const line of rl) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let entry: any;
-      try {
-        entry = JSON.parse(trimmed);
-      } catch {
-        continue;
-      }
+    try {
+      for await (const line of rl) {
+        if (line.length > MAX_JSONL_LINE_LENGTH) {
+          parseFailed = true;
+          break;
+        }
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let entry: any;
+        try {
+          entry = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
 
-      const entryType = entry?.type;
+        const entryType = entry?.type;
 
-      if (entryType === "session_meta") {
-        const metaPayload = entry?.payload;
-        const sessionTimestamp = entry?.payload?.timestamp ?? entry?.timestamp;
-        if (sessionTimestamp) {
-          const parsedDate = new Date(sessionTimestamp);
-          if (!sessionDate || parsedDate < sessionDate) {
-            sessionDate = parsedDate;
+        if (entryType === "session_meta") {
+          const metaPayload = entry?.payload;
+          const sessionTimestamp = entry?.payload?.timestamp ?? entry?.timestamp;
+          if (sessionTimestamp) {
+            const parsedDate = new Date(sessionTimestamp);
+            if (!sessionDate || parsedDate < sessionDate) {
+              sessionDate = parsedDate;
+            }
           }
-        }
-        const cwd = entry?.payload?.cwd;
-        if (cwd) {
-          sessionCwd = cwd;
-        }
-        if (!sessionId) {
-          const parsedSessionId = asNonEmptyString(metaPayload?.id);
-          if (parsedSessionId) {
-            sessionId = parsedSessionId;
+          const cwd = entry?.payload?.cwd;
+          if (cwd) {
+            sessionCwd = cwd;
           }
-        }
-        if (!forkedFromId) {
-          const parsedForkedFromId = asNonEmptyString(metaPayload?.forked_from_id);
-          if (parsedForkedFromId) {
-            forkedFromId = parsedForkedFromId;
+          if (!sessionId) {
+            const parsedSessionId = asNonEmptyString(metaPayload?.id);
+            if (parsedSessionId) {
+              sessionId = parsedSessionId;
+            }
           }
+          if (!forkedFromId) {
+            const parsedForkedFromId = asNonEmptyString(metaPayload?.forked_from_id);
+            if (parsedForkedFromId) {
+              forkedFromId = parsedForkedFromId;
+            }
+          }
+          continue;
         }
-        continue;
-      }
 
-      if (entryType === "turn_context") {
-        const model = extractModel(entry?.payload);
-        if (model) {
-          currentModel = model;
-          currentModelIsFallback = false;
+        if (entryType === "turn_context") {
+          const model = extractModel(entry?.payload);
+          if (model) {
+            currentModel = model;
+            currentModelIsFallback = false;
+          }
+          continue;
         }
-        continue;
-      }
 
-      if (entryType === "event_msg") {
-        const payload = entry?.payload;
-        if (payload?.type === "user_message") {
+        if (entryType === "event_msg") {
+          const payload = entry?.payload;
+          if (payload?.type === "user_message") {
+            const timestamp = entry?.timestamp;
+            if (timestamp && isTimestampInYear(timestamp, year)) {
+              userMessages.push({
+                timestamp,
+                signature: createUserMessageSignature(payload),
+              });
+            }
+            continue;
+          }
+
+          if (payload?.type !== "token_count") {
+            continue;
+          }
+
           const timestamp = entry?.timestamp;
-          if (timestamp && isTimestampInYear(timestamp, year)) {
-            userMessages.push({
-              timestamp,
-              signature: createUserMessageSignature(payload),
-            });
+          if (!timestamp) continue;
+          const inTargetYear = isTimestampInYear(timestamp, year);
+
+          const info = payload?.info;
+          const lastUsage = normalizeRawUsage(info?.last_token_usage);
+          const totalUsage = normalizeRawUsage(info?.total_token_usage);
+
+          let raw = lastUsage;
+          if (!raw && totalUsage) {
+            raw = subtractRawUsage(totalUsage, previousTotals);
           }
-          continue;
-        }
 
-        if (payload?.type !== "token_count") {
-          continue;
-        }
+          if (totalUsage) {
+            previousTotals = totalUsage;
+          }
 
-        const timestamp = entry?.timestamp;
-        if (!timestamp) continue;
-        const inTargetYear = isTimestampInYear(timestamp, year);
+          if (!raw) continue;
 
-        const info = payload?.info;
-        const lastUsage = normalizeRawUsage(info?.last_token_usage);
-        const totalUsage = normalizeRawUsage(info?.total_token_usage);
+          const delta = convertToDelta(raw);
+          if (
+            delta.inputTokens === 0 &&
+            delta.cachedInputTokens === 0 &&
+            delta.outputTokens === 0 &&
+            delta.reasoningOutputTokens === 0
+          ) {
+            continue;
+          }
 
-        let raw = lastUsage;
-        if (!raw && totalUsage) {
-          raw = subtractRawUsage(totalUsage, previousTotals);
-        }
+          const extractedModel = extractModel({ ...payload, info });
+          let isFallback = false;
+          if (extractedModel) {
+            currentModel = extractedModel;
+            currentModelIsFallback = false;
+          }
 
-        if (totalUsage) {
-          previousTotals = totalUsage;
-        }
+          let model = extractedModel ?? currentModel;
+          if (!model) {
+            model = LEGACY_FALLBACK_MODEL;
+            isFallback = true;
+            legacyFallbackUsed = true;
+            currentModel = model;
+            currentModelIsFallback = true;
+          } else if (!extractedModel && currentModelIsFallback) {
+            isFallback = true;
+          }
 
-        if (!raw) continue;
+          if (!inTargetYear) {
+            continue;
+          }
 
-        const delta = convertToDelta(raw);
-        if (
-          delta.inputTokens === 0 &&
-          delta.cachedInputTokens === 0 &&
-          delta.outputTokens === 0 &&
-          delta.reasoningOutputTokens === 0
-        ) {
-          continue;
-        }
+          sessionEvents.push({
+            timestamp,
+            model,
+            inputTokens: delta.inputTokens,
+            cachedInputTokens: delta.cachedInputTokens,
+            outputTokens: delta.outputTokens,
+            reasoningOutputTokens: delta.reasoningOutputTokens,
+            totalTokens: delta.totalTokens,
+          });
 
-        const extractedModel = extractModel({ ...payload, info });
-        let isFallback = false;
-        if (extractedModel) {
-          currentModel = extractedModel;
-          currentModelIsFallback = false;
-        }
-
-        let model = extractedModel ?? currentModel;
-        if (!model) {
-          model = LEGACY_FALLBACK_MODEL;
-          isFallback = true;
-          legacyFallbackUsed = true;
-          currentModel = model;
-          currentModelIsFallback = true;
-        } else if (!extractedModel && currentModelIsFallback) {
-          isFallback = true;
-        }
-
-        if (!inTargetYear) {
-          continue;
-        }
-
-        sessionEvents.push({
-          timestamp,
-          model,
-          inputTokens: delta.inputTokens,
-          cachedInputTokens: delta.cachedInputTokens,
-          outputTokens: delta.outputTokens,
-          reasoningOutputTokens: delta.reasoningOutputTokens,
-          totalTokens: delta.totalTokens,
-        });
-
-        if (isFallback) {
-          // No-op for now; kept for parity with ccusage
+          if (isFallback) {
+            // No-op for now; kept for parity with ccusage
+          }
         }
       }
+    } catch {
+      parseFailed = true;
+    } finally {
+      clearTimeout(timeoutHandle);
+      rl.close();
+    }
+
+    if (parseFailed) {
+      continue;
     }
 
     if (legacyFallbackUsed) {
@@ -638,4 +681,20 @@ function formatDateKey(date: Date): string {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<null>((resolve) => {
+        timeoutId = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
 }

@@ -1,6 +1,6 @@
 import type { CodexStats, ModelStats, ProviderStats, WeekdayActivity } from "./types";
 import { collectCodexUsageData, getCodexFirstPromptTimestamp, type CodexUsageEvent } from "./collector";
-import { fetchModelsData, getModelDisplayName, getModelProvider, getProviderDisplayName } from "./models";
+import { getModelDisplayName, getModelProvider, getProviderDisplayName } from "./models";
 import { calculateCostUSD, getModelPricing } from "./pricing";
 
 type ModelUsageTotals = {
@@ -12,8 +12,6 @@ type ModelUsageTotals = {
 };
 
 export async function calculateStats(year: number): Promise<CodexStats> {
-  await fetchModelsData();
-
   const usageData = await collectCodexUsageData(year);
   const dailyActivity = usageData.dailyActivity;
   const weekdayCounts: [number, number, number, number, number, number, number] = [0, 0, 0, 0, 0, 0, 0];
