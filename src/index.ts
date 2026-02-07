@@ -13,7 +13,7 @@ import { isWrappedAvailable } from "./utils/dates";
 import { formatCostFull, formatNumber, formatNumberFull } from "./utils/format";
 import type { CodexStats } from "./types";
 
-const VERSION = "1.0.3";
+const VERSION = "1.0.6";
 
 function printHelp() {
   console.log(`
